@@ -1,7 +1,7 @@
 import { Calendar, Clock, MapPin, User, Phone, CheckCircle2, ArrowLeft, Loader2, X } from 'lucide-react';
 import { useState, useEffect, useCallback } from 'react';
 import type { Turf, Ground, Slot, Booking } from '@/lib/types';
-import { getLocalDateString, addDaysToLocalDate, formatDate, formatTime, normalizePhone } from '@/lib/dateUtils';
+import { getLocalDateString, addDaysToLocalDate, formatDate, formatTime, normalizePhone, addHoursToTime, getDurationInHours } from '@/lib/dateUtils';
 import {
   getTurfs,
   getTurfWithGrounds,
@@ -23,6 +23,7 @@ export default function CustomerBooking({ onExit }: { onExit: () => void }) {
   const [selectedSlot, setSelectedSlot] = useState<Slot | null>(null);
   const [name, setName] = useState('');
   const [phone, setPhone] = useState('');
+  const [selectedDuration, setSelectedDuration] = useState(1);
   const [submitting, setSubmitting] = useState(false);
   const [error, setError] = useState('');
   const [confirmedBooking, setConfirmedBooking] = useState<Booking | null>(null);
@@ -68,9 +69,21 @@ export default function CustomerBooking({ onExit }: { onExit: () => void }) {
     loadSlots();
   };
 
-  const handleSlotSelect = (slot: Slot) => {
-    if (!slot.available) return;
-    setSelectedSlot(slot);
+  const isSlotAvailableForDuration = (idx: number, duration: number) => {
+    if (idx + duration > slots.length) return false;
+    for (let k = 0; k < duration; k++) {
+      if (!slots[idx + k].available) return false;
+    }
+    return true;
+  };
+
+  const handleSlotSelect = (slot: Slot, idx: number) => {
+    if (!isSlotAvailableForDuration(idx, selectedDuration)) return;
+    setSelectedSlot({
+      start_time: slot.start_time,
+      end_time: addHoursToTime(slot.start_time, selectedDuration),
+      available: true,
+    });
     setStep('details');
   };
 
@@ -120,6 +133,7 @@ export default function CustomerBooking({ onExit }: { onExit: () => void }) {
     setSelectedSlot(null);
     setName('');
     setPhone('');
+    setSelectedDuration(1);
     setError('');
     setConfirmedBooking(null);
   };
@@ -294,26 +308,54 @@ export default function CustomerBooking({ onExit }: { onExit: () => void }) {
             <p className="text-sm text-slate-500">
               {selectedGround?.name} · {formatDate(selectedDate)}
             </p>
+
+            {/* Duration selector */}
+            <div className="bg-white p-4 rounded-2xl border border-slate-200 shadow-sm">
+              <label className="block text-xs font-semibold text-slate-400 uppercase tracking-wide mb-2">Duration</label>
+              <div className="flex gap-2">
+                {[1, 2, 3].map((hours) => (
+                  <button
+                    key={hours}
+                    type="button"
+                    onClick={() => {
+                      setSelectedDuration(hours);
+                      setSelectedSlot(null); // Reset selected slot when duration changes
+                    }}
+                    className={`flex-1 py-2.5 rounded-xl text-sm font-medium border transition-all ${
+                      selectedDuration === hours
+                        ? 'bg-emerald-600 border-emerald-600 text-white shadow-sm'
+                        : 'bg-white border-slate-200 text-slate-750 hover:border-slate-300'
+                    }`}
+                  >
+                    {hours} {hours === 1 ? 'Hour' : 'Hours'}
+                  </button>
+                ))}
+              </div>
+            </div>
+
             {slots.length === 0 ? (
               <div className="flex items-center justify-center py-12">
                 <Loader2 className="w-6 h-6 animate-spin text-emerald-600" />
               </div>
             ) : (
               <div className="grid grid-cols-3 gap-2.5">
-                {slots.map((slot) => (
-                  <button
-                    key={slot.start_time}
-                    onClick={() => handleSlotSelect(slot)}
-                    disabled={!slot.available}
-                    className={`py-3 rounded-xl text-sm font-medium transition-all active:scale-95 ${
-                      slot.available
-                        ? 'bg-white border border-slate-200 text-slate-700 hover:border-emerald-500 hover:text-emerald-600 shadow-sm'
-                        : 'bg-slate-100 border border-slate-100 text-slate-300 cursor-not-allowed line-through'
-                    }`}
-                  >
-                    {formatTime(slot.start_time)}
-                  </button>
-                ))}
+                {slots.map((slot, idx) => {
+                  const isAvailable = isSlotAvailableForDuration(idx, selectedDuration);
+                  return (
+                    <button
+                      key={slot.start_time}
+                      onClick={() => handleSlotSelect(slot, idx)}
+                      disabled={!isAvailable}
+                      className={`py-3 rounded-xl text-sm font-medium transition-all active:scale-95 ${
+                        isAvailable
+                          ? 'bg-white border border-slate-200 text-slate-700 hover:border-emerald-500 hover:text-emerald-600 shadow-sm'
+                          : 'bg-slate-100 border border-slate-100 text-slate-300 cursor-not-allowed line-through'
+                      }`}
+                    >
+                      {formatTime(slot.start_time)}
+                    </button>
+                  );
+                })}
               </div>
             )}
           </div>
@@ -373,9 +415,10 @@ export default function CustomerBooking({ onExit }: { onExit: () => void }) {
               <div className="divide-y divide-slate-100">
                 <ReviewRow icon={<Calendar className="w-4 h-4" />} label="Date" value={formatDate(selectedDate)} />
                 <ReviewRow icon={<Clock className="w-4 h-4" />} label="Time" value={`${formatTime(selectedSlot!.start_time)} – ${formatTime(selectedSlot!.end_time)}`} />
+                <ReviewRow icon={<Clock className="w-4 h-4" />} label="Duration" value={`${selectedDuration} ${selectedDuration === 1 ? 'hour' : 'hours'}`} />
                 <ReviewRow icon={<User className="w-4 h-4" />} label="Name" value={name} />
                 <ReviewRow icon={<Phone className="w-4 h-4" />} label="Phone" value={phone} />
-                <ReviewRow label="Price" value={`₹${turf.price_per_hour}`} highlight />
+                <ReviewRow label="Price" value={`₹${turf.price_per_hour * selectedDuration}`} highlight />
               </div>
               <div className="px-5 py-3 bg-amber-50 border-t border-amber-100">
                 <p className="text-sm text-amber-700 font-medium">Payment: Pay at Turf</p>
@@ -410,8 +453,9 @@ export default function CustomerBooking({ onExit }: { onExit: () => void }) {
                 <ReviewRow label="Turf" value={turf.name} />
                 <ReviewRow label="Date" value={formatDate(confirmedBooking.booking_date)} />
                 <ReviewRow label="Time" value={`${formatTime(confirmedBooking.start_time)} – ${formatTime(confirmedBooking.end_time)}`} />
+                <ReviewRow label="Duration" value={`${getDurationInHours(confirmedBooking.start_time, confirmedBooking.end_time)} ${getDurationInHours(confirmedBooking.start_time, confirmedBooking.end_time) === 1 ? 'hour' : 'hours'}`} />
                 <ReviewRow label="Name" value={confirmedBooking.customer_name ?? '-'} />
-                <ReviewRow label="Price" value={`₹${turf.price_per_hour}`} highlight />
+                <ReviewRow label="Price" value={`₹${turf.price_per_hour * getDurationInHours(confirmedBooking.start_time, confirmedBooking.end_time)}`} highlight />
                 <ReviewRow label="Payment" value="Pay at Turf" />
               </div>
             </div>

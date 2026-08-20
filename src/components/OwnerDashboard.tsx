@@ -1,5 +1,5 @@
-import { useState, useEffect, useCallback } from 'react';
-import { getLocalDateString, formatDate, formatTime, normalizePhone } from '@/lib/dateUtils';
+import { useState, useEffect, useCallback, useRef, useMemo } from 'react';
+import { getLocalDateString, formatDate, formatTime, normalizePhone, getLocalMinutes, addHoursToTime, getDurationInHours } from '@/lib/dateUtils';
 import {
   TrendingUp,
   Clock,
@@ -22,8 +22,9 @@ import type { Turf, Ground, Booking, Slot } from '@/lib/types';
 import {
   getTurfs,
   getTurfWithGrounds,
-  getBookingsByDate,
+  getBookingsByGround,
   getAvailableSlots,
+  generateSlots,
   createManualBooking,
   cancelBooking,
   markPaymentPaid,
@@ -42,13 +43,14 @@ export default function OwnerDashboard({ onSignOut }: { onSignOut: () => void })
   const [selectedDate, setSelectedDate] = useState(getLocalDateString());
   const [bookings, setBookings] = useState<Booking[]>([]);
   const [stats, setStats] = useState<DashboardStats>({ totalRevenue: 0, pendingPayments: 0, bookedValue: 0, confirmedCount: 0, blockedCount: 0 });
-  const [slots, setSlots] = useState<Slot[]>([]);
 
   const [showManualBooking, setShowManualBooking] = useState(false);
   const [showBlockSlot, setShowBlockSlot] = useState(false);
   const [actionLoading, setActionLoading] = useState<string | null>(null);
   const [error, setError] = useState('');
   const [toast, setToast] = useState('');
+
+  const lastRequestTimestamp = useRef(0);
 
   useEffect(() => {
     (async () => {
@@ -72,15 +74,18 @@ export default function OwnerDashboard({ onSignOut }: { onSignOut: () => void })
 
   const refreshData = useCallback(async () => {
     if (!turf || !selectedGround) return;
+    const timestamp = Date.now();
+    lastRequestTimestamp.current = timestamp;
     try {
-      const [todayBookings, availSlots] = await Promise.all([
-        getBookingsByDate(turf.id, selectedDate),
-        getAvailableSlots(selectedGround.id, turf, selectedDate),
-      ]);
+      const todayBookings = await getBookingsByGround(selectedGround.id, selectedDate);
+      if (timestamp < lastRequestTimestamp.current) {
+        return;
+      }
       setBookings(todayBookings);
-      setSlots(availSlots);
       setStats(calculateStats(todayBookings, turf.price_per_hour));
+      setError('');
     } catch (e) {
+      if (timestamp < lastRequestTimestamp.current) return;
       setError(e instanceof Error ? e.message : 'Failed to refresh data');
     }
   }, [turf, selectedGround, selectedDate]);
@@ -88,6 +93,39 @@ export default function OwnerDashboard({ onSignOut }: { onSignOut: () => void })
   useEffect(() => {
     if (turf && selectedGround) refreshData();
   }, [turf, selectedGround, selectedDate, refreshData]);
+
+  const slots = useMemo(() => {
+    if (!turf || !selectedGround) return [];
+    const allSlots = generateSlots(turf);
+    
+    // Filter bookings for the selected ground that are active (confirmed or blocked)
+    const activeBookings = bookings.filter(
+      (b) => b.ground_id === selectedGround.id && (b.status === 'confirmed' || b.status === 'blocked')
+    );
+
+    const todayStr = getLocalDateString();
+    const currentMinutes = getLocalMinutes();
+
+    return allSlots.map((slot) => {
+      const [h, m] = slot.start_time.split(':').map(Number);
+      const slotMinutes = h * 60 + m;
+
+      const isTaken = activeBookings.some((b) => {
+        const [startH, startM] = b.start_time.split(':').map(Number);
+        const [endH, endM] = b.end_time.split(':').map(Number);
+        const startMin = startH * 60 + startM;
+        const endMin = endH * 60 + endM;
+        return slotMinutes >= startMin && slotMinutes < endMin;
+      });
+
+      const isPast = selectedDate === todayStr && slotMinutes <= currentMinutes;
+      return {
+        start_time: slot.start_time,
+        end_time: slot.end_time,
+        available: !isTaken && !isPast,
+      };
+    });
+  }, [turf, selectedGround, bookings, selectedDate]);
 
   const showToast = (msg: string) => {
     setToast(msg);
@@ -405,12 +443,19 @@ function BookingCard({
                   </p>
                 </div>
                 <div className="text-right">
-                  <p className="text-sm font-semibold text-slate-700">₹{pricePerHour}</p>
-                  <span className={`text-xs px-2 py-0.5 rounded-full ${
-                    booking.source === 'owner' ? 'bg-blue-50 text-blue-600' : 'bg-slate-100 text-slate-500'
-                  }`}>
-                    {booking.source === 'owner' ? 'Owner' : 'Customer'}
-                  </span>
+                  <p className="text-sm font-semibold text-slate-700">
+                    ₹{pricePerHour * getDurationInHours(booking.start_time, booking.end_time)}
+                  </p>
+                  <div className="flex flex-col items-end gap-1 mt-1">
+                    <span className={`text-xs px-2 py-0.5 rounded-full ${
+                      booking.source === 'owner' ? 'bg-blue-50 text-blue-600' : 'bg-slate-100 text-slate-500'
+                    }`}>
+                      {booking.source === 'owner' ? 'Owner' : 'Customer'}
+                    </span>
+                    <span className="text-[10px] text-slate-400 font-medium">
+                      {getDurationInHours(booking.start_time, booking.end_time)} {getDurationInHours(booking.start_time, booking.end_time) === 1 ? 'hour' : 'hours'}
+                    </span>
+                  </div>
                 </div>
               </div>
 
@@ -512,6 +557,7 @@ function ManualBookingModal({
 }) {
   const [slots, setSlots] = useState<Slot[]>([]);
   const [selectedSlot, setSelectedSlot] = useState<Slot | null>(null);
+  const [selectedDuration, setSelectedDuration] = useState(1);
   const [name, setName] = useState('');
   const [phone, setPhone] = useState('');
   const [loading, setLoading] = useState(true);
@@ -525,7 +571,7 @@ function ManualBookingModal({
     setError('');
     try {
       const result = await getAvailableSlots(ground.id, turf, date);
-      setSlots(result.filter((s) => s.available));
+      setSlots(result);
     } catch (e) {
       setError(e instanceof Error ? e.message : 'Failed to load slots');
     } finally {
@@ -537,8 +583,26 @@ function ManualBookingModal({
     loadSlots();
   }, [loadSlots]);
 
+  const isSlotAvailableForDuration = (idx: number, duration: number) => {
+    if (idx + duration > slots.length) return false;
+    for (let k = 0; k < duration; k++) {
+      if (!slots[idx + k].available) return false;
+    }
+    return true;
+  };
+
+  const handleSlotClick = (slot: Slot, idx: number) => {
+    if (!isSlotAvailableForDuration(idx, selectedDuration)) return;
+    setSelectedSlot({
+      start_time: slot.start_time,
+      end_time: addHoursToTime(slot.start_time, selectedDuration),
+      available: true,
+    });
+  };
+
   const resetForm = () => {
     setSelectedSlot(null);
+    setSelectedDuration(1);
     setName('');
     setPhone('');
     setError('');
@@ -625,12 +689,20 @@ function ManualBookingModal({
                   </span>
                 </div>
                 <div className="flex items-center justify-between px-5 py-3.5">
+                  <span className="text-sm text-slate-500">Duration</span>
+                  <span className="text-sm font-semibold text-slate-800">
+                    {selectedSlot ? `${getDurationInHours(selectedSlot.start_time, selectedSlot.end_time)} ${getDurationInHours(selectedSlot.start_time, selectedSlot.end_time) === 1 ? 'hour' : 'hours'}` : '-'}
+                  </span>
+                </div>
+                <div className="flex items-center justify-between px-5 py-3.5">
                   <span className="text-sm text-slate-500">Customer</span>
                   <span className="text-sm font-semibold text-slate-800">{name}</span>
                 </div>
                 <div className="flex items-center justify-between px-5 py-3.5">
                   <span className="text-sm text-slate-500">Price</span>
-                  <span className="text-sm font-semibold text-emerald-600">₹{turf.price_per_hour}</span>
+                  <span className="text-sm font-semibold text-emerald-600">
+                    ₹{selectedSlot ? turf.price_per_hour * getDurationInHours(selectedSlot.start_time, selectedSlot.end_time) : 0}
+                  </span>
                 </div>
                 <div className="flex items-center justify-between px-5 py-3.5">
                   <span className="text-sm text-slate-500">Payment</span>
@@ -685,23 +757,55 @@ function ManualBookingModal({
                   </div>
                 </div>
 
+                {/* Duration selector */}
+                <div>
+                  <label className="block text-sm font-medium text-slate-700 mb-2">Duration</label>
+                  <div className="flex gap-2">
+                    {[1, 2, 3].map((hours) => (
+                      <button
+                        key={hours}
+                        type="button"
+                        onClick={() => {
+                          setSelectedDuration(hours);
+                          setSelectedSlot(null); // Reset selection when duration changes
+                        }}
+                        className={`flex-1 py-2.5 rounded-xl text-sm font-medium border transition-all ${
+                          selectedDuration === hours
+                            ? 'bg-emerald-600 border-emerald-600 text-white shadow-sm'
+                            : 'bg-white border-slate-200 text-slate-700 hover:border-slate-300'
+                        }`}
+                      >
+                        {hours} {hours === 1 ? 'Hour' : 'Hours'}
+                      </button>
+                    ))}
+                  </div>
+                </div>
+
                 {/* Slot selection */}
                 <div>
                   <label className="block text-sm font-medium text-slate-700 mb-2">Select Available Slot</label>
                   <div className="grid grid-cols-4 gap-2">
-                    {slots.map((slot) => (
-                      <button
-                        key={slot.start_time}
-                        onClick={() => setSelectedSlot(slot)}
-                        className={`py-2.5 rounded-lg text-xs font-medium transition-all ${
-                          selectedSlot?.start_time === slot.start_time
-                            ? 'bg-emerald-600 text-white'
-                            : 'bg-slate-50 text-slate-600 border border-slate-200 hover:border-emerald-400'
-                        }`}
-                      >
-                        {formatTime(slot.start_time)}
-                      </button>
-                    ))}
+                    {slots.map((slot, idx) => {
+                      const isAvailable = isSlotAvailableForDuration(idx, selectedDuration);
+                      const isSelected = selectedSlot?.start_time === slot.start_time;
+                      return (
+                        <button
+                          key={slot.start_time}
+                          type="button"
+                          disabled={!isAvailable}
+                          onClick={() => handleSlotClick(slot, idx)}
+                          className={`py-2.5 rounded-lg text-xs font-medium transition-all ${
+                            isSelected
+                              ? 'bg-emerald-600 text-white shadow-sm'
+                              : isAvailable
+                              ? 'bg-slate-50 text-slate-650 border border-slate-200 hover:border-emerald-400'
+                              : 'bg-slate-100 text-slate-300 cursor-not-allowed line-through'
+                          }`}
+                        >
+                          {formatTime(slot.start_time)}
+                        </button>
+                      );
+                    })}
                   </div>
                 </div>
 
@@ -734,7 +838,7 @@ function ManualBookingModal({
                 <div className="bg-slate-50 rounded-xl border border-slate-200 p-4 space-y-2">
                   <div className="flex items-center justify-between">
                     <span className="text-sm text-slate-500">Price</span>
-                    <span className="text-sm font-semibold text-slate-800">₹{turf.price_per_hour}</span>
+                    <span className="text-sm font-semibold text-slate-800">₹{turf.price_per_hour * selectedDuration}</span>
                   </div>
                   <div className="flex items-center justify-between">
                     <span className="text-sm text-slate-500">Payment Status</span>
@@ -777,6 +881,7 @@ function BlockSlotModal({
 }) {
   const [slots, setSlots] = useState<Slot[]>([]);
   const [selectedSlot, setSelectedSlot] = useState<Slot | null>(null);
+  const [selectedDuration, setSelectedDuration] = useState(1);
   const [loading, setLoading] = useState(true);
   const [submitting, setSubmitting] = useState(false);
   const [error, setError] = useState('');
@@ -785,7 +890,7 @@ function BlockSlotModal({
     (async () => {
       try {
         const result = await getAvailableSlots(ground.id, turf, date);
-        setSlots(result.filter((s) => s.available));
+        setSlots(result);
       } catch (e) {
         setError(e instanceof Error ? e.message : 'Failed to load slots');
       } finally {
@@ -793,6 +898,23 @@ function BlockSlotModal({
       }
     })();
   }, [ground.id, turf, date]);
+
+  const isSlotAvailableForDuration = (idx: number, duration: number) => {
+    if (idx + duration > slots.length) return false;
+    for (let k = 0; k < duration; k++) {
+      if (!slots[idx + k].available) return false;
+    }
+    return true;
+  };
+
+  const handleSlotClick = (slot: Slot, idx: number) => {
+    if (!isSlotAvailableForDuration(idx, selectedDuration)) return;
+    setSelectedSlot({
+      start_time: slot.start_time,
+      end_time: addHoursToTime(slot.start_time, selectedDuration),
+      available: true,
+    });
+  };
 
   const handleBlock = async () => {
     if (!selectedSlot) return;
@@ -822,21 +944,57 @@ function BlockSlotModal({
           <p className="text-sm text-slate-500 text-center py-4">No available slots to block.</p>
         ) : (
           <>
-            <div className="grid grid-cols-4 gap-2">
-              {slots.map((slot) => (
-                <button
-                  key={slot.start_time}
-                  onClick={() => setSelectedSlot(slot)}
-                  className={`py-2.5 rounded-lg text-xs font-medium transition-all ${
-                    selectedSlot?.start_time === slot.start_time
-                      ? 'bg-slate-800 text-white'
-                      : 'bg-slate-50 text-slate-600 border border-slate-200 hover:border-slate-400'
-                  }`}
-                >
-                  {formatTime(slot.start_time)}
-                </button>
-              ))}
+            {/* Duration selector */}
+            <div>
+              <label className="block text-xs font-semibold text-slate-400 uppercase tracking-wide mb-2">Duration</label>
+              <div className="flex gap-2">
+                {[1, 2, 3].map((hours) => (
+                  <button
+                    key={hours}
+                    type="button"
+                    onClick={() => {
+                      setSelectedDuration(hours);
+                      setSelectedSlot(null); // Reset selection when duration changes
+                    }}
+                    className={`flex-1 py-2 rounded-xl text-xs font-medium border transition-all ${
+                      selectedDuration === hours
+                        ? 'bg-slate-800 border-slate-800 text-white shadow-sm'
+                        : 'bg-white border-slate-200 text-slate-700 hover:border-slate-350'
+                    }`}
+                  >
+                    {hours} {hours === 1 ? 'Hour' : 'Hours'}
+                  </button>
+                ))}
+              </div>
             </div>
+
+            <div>
+              <label className="block text-xs font-semibold text-slate-400 uppercase tracking-wide mb-2">Select Start Time</label>
+              <div className="grid grid-cols-4 gap-2">
+                {slots.map((slot, idx) => {
+                  const isAvailable = isSlotAvailableForDuration(idx, selectedDuration);
+                  const isSelected = selectedSlot?.start_time === slot.start_time;
+                  return (
+                    <button
+                      key={slot.start_time}
+                      type="button"
+                      disabled={!isAvailable}
+                      onClick={() => handleSlotClick(slot, idx)}
+                      className={`py-2.5 rounded-lg text-xs font-medium transition-all ${
+                        isSelected
+                          ? 'bg-slate-800 text-white shadow-sm'
+                          : isAvailable
+                          ? 'bg-slate-50 text-slate-600 border border-slate-200 hover:border-slate-400'
+                          : 'bg-slate-100 text-slate-300 cursor-not-allowed line-through'
+                      }`}
+                    >
+                      {formatTime(slot.start_time)}
+                    </button>
+                  );
+                })}
+              </div>
+            </div>
+
             <button
               onClick={handleBlock}
               disabled={!selectedSlot || submitting}

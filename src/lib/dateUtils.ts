@@ -96,3 +96,21 @@ export function normalizePhone(input: string): string | null {
 
   return null;
 }
+
+/**
+ * Add hours to a HH:MM time string and return the HH:MM result.
+ */
+export function addHoursToTime(timeStr: string, hours: number): string {
+  const [h, m] = timeStr.split(':').map(Number);
+  const newH = h + hours;
+  return `${String(newH).padStart(2, '0')}:${String(m).padStart(2, '0')}`;
+}
+
+/**
+ * Compute the duration in hours between two HH:MM or HH:MM:SS time strings.
+ */
+export function getDurationInHours(startTime: string, endTime: string): number {
+  const [startH, startM] = startTime.split(':').map(Number);
+  const [endH, endM] = endTime.split(':').map(Number);
+  return (endH * 60 + endM - (startH * 60 + startM)) / 60;
+}

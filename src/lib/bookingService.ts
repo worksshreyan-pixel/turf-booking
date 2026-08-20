@@ -1,5 +1,5 @@
 import { supabase } from './supabase';
-import { getLocalDateString, getLocalMinutes, normalizePhone } from './dateUtils';
+import { getLocalDateString, getLocalMinutes, normalizePhone, getDurationInHours } from './dateUtils';
 import type {
   Turf,
   Ground,
@@ -90,16 +90,18 @@ export function generateSlots(turf: Turf): { start_time: string; end_time: strin
 export async function getBookingsForDate(
   groundId: string,
   date: string
-): Promise<Booking[]> {
-  const { data, error } = await supabase
-    .from('bookings')
-    .select('*')
-    .eq('ground_id', groundId)
-    .eq('booking_date', date)
-    .in('status', ['confirmed', 'blocked'])
-    .order('start_time');
+): Promise<Pick<Booking, 'start_time' | 'end_time'>[]> {
+  const { data, error } = await supabase.rpc('get_active_slots', {
+    p_ground_id: groundId,
+    p_date: date,
+  });
   if (error) throw new Error(error.message);
-  return data ?? [];
+  
+  // Normalize time strings to HH:MM to match generated slots
+  return (data ?? []).map((row: any) => ({
+    start_time: row.start_time.slice(0, 5),
+    end_time: row.end_time.slice(0, 5),
+  }));
 }
 
 /**
@@ -146,6 +148,23 @@ export async function getBookings(
 }
 
 /**
+ * Get all bookings for a ground on a given date.
+ */
+export async function getBookingsByGround(
+  groundId: string,
+  date: string
+): Promise<Booking[]> {
+  const { data, error } = await supabase
+    .from('bookings')
+    .select('*')
+    .eq('ground_id', groundId)
+    .eq('booking_date', date)
+    .order('start_time');
+  if (error) throw new Error(error.message);
+  return data ?? [];
+}
+
+/**
  * Check whether a specific slot is available for booking.
  * This is a pre-check only — the database unique index is the final authority.
  */
@@ -171,19 +190,26 @@ export async function getAvailableSlots(
   const allSlots = generateSlots(turf);
   const bookings = await getBookingsForDate(groundId, date);
 
-  const takenStarts = new Set(bookings.map((b) => b.start_time));
-
   const todayStr = getLocalDateString();
   const currentMinutes = getLocalMinutes();
 
   return allSlots.map((slot) => {
     const [h, m] = slot.start_time.split(':').map(Number);
     const slotMinutes = h * 60 + m;
+
+    const isTaken = bookings.some((b) => {
+      const [startH, startM] = b.start_time.split(':').map(Number);
+      const [endH, endM] = b.end_time.split(':').map(Number);
+      const startMin = startH * 60 + startM;
+      const endMin = endH * 60 + endM;
+      return slotMinutes >= startMin && slotMinutes < endMin;
+    });
+
     const isPast = date === todayStr && slotMinutes <= currentMinutes;
     return {
       start_time: slot.start_time,
       end_time: slot.end_time,
-      available: !takenStarts.has(slot.start_time) && !isPast,
+      available: !isTaken && !isPast,
     };
   });
 }
@@ -228,9 +254,14 @@ export async function createBooking(
     return { success: false, error: 'This slot is no longer available. Please pick another time.' };
   }
 
-  const { data, error } = await supabase
+  // Generate UUID client-side to avoid needing SELECT privileges for returning the row
+  const bookingId = crypto.randomUUID();
+  const bookingSource = params.source ?? 'customer';
+
+  const { error } = await supabase
     .from('bookings')
     .insert({
+      id: bookingId,
       ground_id: params.ground_id,
       turf_id: params.turf_id,
       booking_date: params.booking_date,
@@ -240,10 +271,8 @@ export async function createBooking(
       customer_phone: normalizedPhone,
       status: 'confirmed',
       payment_status: 'pending',
-      source: params.source ?? 'customer',
-    })
-    .select()
-    .single();
+      source: bookingSource,
+    });
 
   if (error) {
     if (error.code === '23505') {
@@ -251,7 +280,26 @@ export async function createBooking(
     }
     return { success: false, error: error.message };
   }
-  return { success: true, booking: data };
+
+  // Construct the booking object to return
+  const nowStr = new Date().toISOString();
+  const booking: Booking = {
+    id: bookingId,
+    ground_id: params.ground_id,
+    turf_id: params.turf_id,
+    booking_date: params.booking_date,
+    start_time: params.start_time,
+    end_time: params.end_time,
+    customer_name: params.customer_name.trim(),
+    customer_phone: normalizedPhone,
+    status: 'confirmed',
+    payment_status: 'pending',
+    source: bookingSource,
+    created_at: nowStr,
+    updated_at: nowStr,
+  };
+
+  return { success: true, booking };
 }
 
 /**
@@ -401,10 +449,14 @@ export function calculateStats(bookings: Booking[], pricePerHour: number): Dashb
   const paid = active.filter((b) => b.payment_status === 'paid');
   const pending = active.filter((b) => b.payment_status === 'pending');
 
+  const paidHours = paid.reduce((sum, b) => sum + getDurationInHours(b.start_time, b.end_time), 0);
+  const pendingHours = pending.reduce((sum, b) => sum + getDurationInHours(b.start_time, b.end_time), 0);
+  const activeHours = active.reduce((sum, b) => sum + getDurationInHours(b.start_time, b.end_time), 0);
+
   return {
-    totalRevenue: paid.length * pricePerHour,
-    pendingPayments: pending.length * pricePerHour,
-    bookedValue: active.length * pricePerHour,
+    totalRevenue: paidHours * pricePerHour,
+    pendingPayments: pendingHours * pricePerHour,
+    bookedValue: activeHours * pricePerHour,
     confirmedCount: active.length,
     blockedCount: blocked.length,
   };
