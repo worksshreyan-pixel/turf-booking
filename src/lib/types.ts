@@ -1,5 +1,5 @@
-export type BookingStatus = 'confirmed' | 'cancelled' | 'blocked';
-export type PaymentStatus = 'pending' | 'paid';
+export type BookingStatus = 'confirmed' | 'cancelled' | 'blocked' | 'holding';
+export type PaymentStatus = 'pending' | 'paid' | 'advance_pending' | 'advance_paid' | 'fully_paid';
 export type BookingSource = 'customer' | 'owner';
 
 export interface Turf {
@@ -11,6 +11,7 @@ export interface Turf {
   closing_time: string;
   slot_duration_minutes: number;
   owner_id: string | null;
+  advance_percentage?: number;
   created_at: string;
   updated_at: string;
 }
@@ -34,6 +35,7 @@ export interface Booking {
   status: BookingStatus;
   payment_status: PaymentStatus;
   source: BookingSource;
+  reservation_expires_at?: string;
   created_at: string;
   updated_at: string;
 }

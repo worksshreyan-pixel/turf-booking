@@ -7,6 +7,8 @@ import type {
   Slot,
   BookingResult,
   TurfWithGrounds,
+  BookingStatus,
+  PaymentStatus,
 } from './types';
 
 // ---------------------------------------------------------------------------
@@ -171,10 +173,23 @@ export async function getBookingsByGround(
 export async function checkAvailability(
   groundId: string,
   date: string,
-  startTime: string
+  startTime: string,
+  endTime: string
 ): Promise<boolean> {
   const bookings = await getBookingsForDate(groundId, date);
-  return !bookings.some((b) => b.start_time === startTime);
+  const [startH, startM] = startTime.split(':').map(Number);
+  const [endH, endM] = endTime.split(':').map(Number);
+  const reqStart = startH * 60 + startM;
+  const reqEnd = endH * 60 + endM;
+
+  return !bookings.some((b) => {
+    const [bStartH, bStartM] = b.start_time.split(':').map(Number);
+    const [bEndH, bEndM] = b.end_time.split(':').map(Number);
+    const bStart = bStartH * 60 + bStartM;
+    const bEnd = bEndH * 60 + bEndM;
+    // Overlap condition: start1 < end2 AND start2 < end1
+    return reqStart < bEnd && bStart < reqEnd;
+  });
 }
 
 /**
@@ -214,10 +229,6 @@ export async function getAvailableSlots(
   });
 }
 
-// ---------------------------------------------------------------------------
-// Booking mutations
-// ---------------------------------------------------------------------------
-
 interface CreateBookingParams {
   ground_id: string;
   turf_id: string;
@@ -227,6 +238,9 @@ interface CreateBookingParams {
   customer_name: string;
   customer_phone: string;
   source?: 'customer' | 'owner';
+  status?: BookingStatus;
+  payment_status?: PaymentStatus;
+  reservation_expires_at?: string;
 }
 
 /**
@@ -248,15 +262,25 @@ export async function createBooking(
   const available = await checkAvailability(
     params.ground_id,
     params.booking_date,
-    params.start_time
+    params.start_time,
+    params.end_time
   );
   if (!available) {
-    return { success: false, error: 'This slot is no longer available. Please pick another time.' };
+    return { success: false, error: 'This slot range is no longer available. Please pick another time.' };
   }
 
   // Generate UUID client-side to avoid needing SELECT privileges for returning the row
   const bookingId = crypto.randomUUID();
   const bookingSource = params.source ?? 'customer';
+  
+  // Customers default to temporary reservation status
+  const bookingStatus = params.status ?? (bookingSource === 'owner' ? 'confirmed' : 'holding');
+  const paymentStatus = params.payment_status ?? (bookingSource === 'owner' ? 'pending' : 'advance_pending');
+  
+  // 5 minutes expiry for temporary reservations
+  const expiresAt = params.reservation_expires_at ?? (bookingStatus === 'holding' 
+    ? new Date(Date.now() + 5 * 60 * 1000).toISOString() 
+    : null);
 
   const { error } = await supabase
     .from('bookings')
@@ -269,13 +293,14 @@ export async function createBooking(
       end_time: params.end_time,
       customer_name: params.customer_name.trim(),
       customer_phone: normalizedPhone,
-      status: 'confirmed',
-      payment_status: 'pending',
+      status: bookingStatus,
+      payment_status: paymentStatus,
       source: bookingSource,
+      reservation_expires_at: expiresAt,
     });
 
   if (error) {
-    if (error.code === '23505') {
+    if (error.code === '23505' || error.code === '23P01') {
       return { success: false, error: 'This slot was just booked by someone else. Please pick another time.' };
     }
     return { success: false, error: error.message };
@@ -292,14 +317,57 @@ export async function createBooking(
     end_time: params.end_time,
     customer_name: params.customer_name.trim(),
     customer_phone: normalizedPhone,
-    status: 'confirmed',
-    payment_status: 'pending',
+    status: bookingStatus,
+    payment_status: paymentStatus,
     source: bookingSource,
+    reservation_expires_at: expiresAt ?? undefined,
     created_at: nowStr,
     updated_at: nowStr,
   };
 
+  // Broadcast HMR / Realtime update signal
+  try {
+    const channel = supabase.channel('realtime-bookings');
+    await channel.send({
+      type: 'broadcast',
+      event: 'booking-updated',
+      payload: { ground_id: params.ground_id, date: params.booking_date },
+    });
+  } catch (e) {
+    console.error('Failed to broadcast realtime event:', e);
+  }
+
   return { success: true, booking };
+}
+
+/**
+ * Call stored RPC procedure to transition booking from holding to confirmed.
+ */
+export async function confirmBookingPayment(
+  bookingId: string
+): Promise<{ success: boolean; error?: string }> {
+  const { data, error } = await supabase.rpc('confirm_booking_payment', {
+    p_booking_id: bookingId,
+  });
+  if (error) return { success: false, error: error.message };
+
+  if (data.success && data.ground_id && data.booking_date) {
+    try {
+      const channel = supabase.channel('realtime-bookings');
+      await channel.send({
+        type: 'broadcast',
+        event: 'booking-updated',
+        payload: { ground_id: data.ground_id, date: data.booking_date },
+      });
+    } catch (e) {
+      console.error('Failed to broadcast realtime event:', e);
+    }
+  }
+
+  return {
+    success: data.success,
+    error: data.error,
+  };
 }
 
 /**
@@ -322,12 +390,25 @@ export async function cancelBooking(bookingId: string): Promise<BookingResult> {
     .from('bookings')
     .update({ status: 'cancelled' })
     .eq('id', bookingId)
-    .in('status', ['confirmed', 'blocked'])
+    .in('status', ['confirmed', 'blocked', 'holding'])
     .select()
     .maybeSingle();
 
   if (error) return { success: false, error: error.message };
   if (!data) return { success: false, error: 'Booking not found or already cancelled.' };
+
+  // Broadcast cancel update
+  try {
+    const channel = supabase.channel('realtime-bookings');
+    await channel.send({
+      type: 'broadcast',
+      event: 'booking-updated',
+      payload: { ground_id: data.ground_id, date: data.booking_date },
+    });
+  } catch (e) {
+    console.error('Failed to broadcast realtime event:', e);
+  }
+
   return { success: true, booking: data };
 }
 
@@ -360,7 +441,7 @@ export async function blockSlot(
   startTime: string,
   endTime: string
 ): Promise<BookingResult> {
-  const available = await checkAvailability(groundId, date, startTime);
+  const available = await checkAvailability(groundId, date, startTime, endTime);
   if (!available) {
     return { success: false, error: 'This slot is already booked or blocked.' };
   }
@@ -383,11 +464,24 @@ export async function blockSlot(
     .single();
 
   if (error) {
-    if (error.code === '23505') {
+    if (error.code === '23505' || error.code === '23P01') {
       return { success: false, error: 'This slot is already booked or blocked.' };
     }
     return { success: false, error: error.message };
   }
+
+  // Broadcast block update
+  try {
+    const channel = supabase.channel('realtime-bookings');
+    await channel.send({
+      type: 'broadcast',
+      event: 'booking-updated',
+      payload: { ground_id: groundId, date },
+    });
+  } catch (e) {
+    console.error('Failed to broadcast realtime event:', e);
+  }
+
   return { success: true, booking: data };
 }
 
@@ -405,6 +499,19 @@ export async function unblockSlot(bookingId: string): Promise<BookingResult> {
 
   if (error) return { success: false, error: error.message };
   if (!data) return { success: false, error: 'Blocked slot not found.' };
+
+  // Broadcast unblock update
+  try {
+    const channel = supabase.channel('realtime-bookings');
+    await channel.send({
+      type: 'broadcast',
+      event: 'booking-updated',
+      payload: { ground_id: data.ground_id, date: data.booking_date },
+    });
+  } catch (e) {
+    console.error('Failed to broadcast realtime event:', e);
+  }
+
   return { success: true, booking: data };
 }
 
@@ -443,20 +550,38 @@ export interface DashboardStats {
  * - bookedValue: all confirmed bookings regardless of payment status
  * - cancelled and blocked bookings never count toward revenue
  */
-export function calculateStats(bookings: Booking[], pricePerHour: number): DashboardStats {
+export function calculateStats(
+  bookings: Booking[],
+  pricePerHour: number,
+  advancePercentage = 25
+): DashboardStats {
   const active = bookings.filter((b) => b.status === 'confirmed');
   const blocked = bookings.filter((b) => b.status === 'blocked');
-  const paid = active.filter((b) => b.payment_status === 'paid');
-  const pending = active.filter((b) => b.payment_status === 'pending');
 
-  const paidHours = paid.reduce((sum, b) => sum + getDurationInHours(b.start_time, b.end_time), 0);
-  const pendingHours = pending.reduce((sum, b) => sum + getDurationInHours(b.start_time, b.end_time), 0);
-  const activeHours = active.reduce((sum, b) => sum + getDurationInHours(b.start_time, b.end_time), 0);
+  let totalRevenue = 0;
+  let pendingPayments = 0;
+  let bookedValue = 0;
+
+  active.forEach((b) => {
+    const duration = getDurationInHours(b.start_time, b.end_time);
+    const totalPrice = pricePerHour * duration;
+    bookedValue += totalPrice;
+
+    if (b.payment_status === 'fully_paid' || b.payment_status === 'paid') {
+      totalRevenue += totalPrice;
+    } else if (b.payment_status === 'advance_paid') {
+      const adv = Math.ceil((totalPrice * advancePercentage) / 100);
+      totalRevenue += adv;
+      pendingPayments += (totalPrice - adv);
+    } else {
+      pendingPayments += totalPrice;
+    }
+  });
 
   return {
-    totalRevenue: paidHours * pricePerHour,
-    pendingPayments: pendingHours * pricePerHour,
-    bookedValue: activeHours * pricePerHour,
+    totalRevenue,
+    pendingPayments,
+    bookedValue,
     confirmedCount: active.length,
     blockedCount: blocked.length,
   };

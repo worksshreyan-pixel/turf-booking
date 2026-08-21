@@ -17,8 +17,9 @@ import {
   X,
   ArrowLeft,
   LogOut,
+  AlertCircle,
 } from 'lucide-react';
-import type { Turf, Ground, Booking, Slot } from '@/lib/types';
+import type { Turf, Ground, Booking, Slot, BookingStatus, PaymentStatus } from '@/lib/types';
 import {
   getTurfs,
   getTurfWithGrounds,
@@ -33,6 +34,7 @@ import {
   calculateStats,
   type DashboardStats,
 } from '@/lib/bookingService';
+import { supabase } from '@/lib/supabase';
 
 export default function OwnerDashboard({ onSignOut }: { onSignOut: () => void }) {
   const [turf, setTurf] = useState<Turf | null>(null);
@@ -82,7 +84,7 @@ export default function OwnerDashboard({ onSignOut }: { onSignOut: () => void })
         return;
       }
       setBookings(todayBookings);
-      setStats(calculateStats(todayBookings, turf.price_per_hour));
+      setStats(calculateStats(todayBookings, turf.price_per_hour, turf.advance_percentage));
       setError('');
     } catch (e) {
       if (timestamp < lastRequestTimestamp.current) return;
@@ -94,13 +96,32 @@ export default function OwnerDashboard({ onSignOut }: { onSignOut: () => void })
     if (turf && selectedGround) refreshData();
   }, [turf, selectedGround, selectedDate, refreshData]);
 
+  // Realtime subscription for automatic dashboard refreshes
+  useEffect(() => {
+    if (!selectedGround || !selectedDate) return;
+
+    const channel = supabase
+      .channel('realtime-bookings-owner-change')
+      .on('broadcast', { event: 'booking-updated' }, (payload: any) => {
+        const { ground_id, date } = payload.payload;
+        if (ground_id === selectedGround.id && date === selectedDate) {
+          refreshData();
+        }
+      })
+      .subscribe();
+
+    return () => {
+      supabase.removeChannel(channel);
+    };
+  }, [selectedGround, selectedDate, refreshData]);
+
   const slots = useMemo(() => {
     if (!turf || !selectedGround) return [];
     const allSlots = generateSlots(turf);
     
-    // Filter bookings for the selected ground that are active (confirmed or blocked)
+    // Include holding (reservations), confirmed, and blocked
     const activeBookings = bookings.filter(
-      (b) => b.ground_id === selectedGround.id && (b.status === 'confirmed' || b.status === 'blocked')
+      (b) => b.ground_id === selectedGround.id && (b.status === 'confirmed' || b.status === 'blocked' || b.status === 'holding')
     );
 
     const todayStr = getLocalDateString();
@@ -198,101 +219,79 @@ export default function OwnerDashboard({ onSignOut }: { onSignOut: () => void })
           </div>
           <div className="text-right">
             <p className="text-xs text-slate-400">{isToday ? 'Today' : formatDate(selectedDate)}</p>
-            <input
-              type="date"
-              value={selectedDate}
-              onChange={(e) => setSelectedDate(e.target.value)}
-              className="mt-1 bg-slate-800 text-white text-sm rounded-lg px-3 py-1.5 border border-slate-700 focus:outline-none focus:ring-1 focus:ring-emerald-500"
-            />
             <button
               onClick={onSignOut}
-              className="mt-2 flex items-center gap-1.5 ml-auto px-3 py-1.5 rounded-lg bg-slate-800 text-slate-300 text-xs font-medium hover:bg-red-900 hover:text-red-200 transition-colors"
+              className="flex items-center gap-1 mt-2 text-xs font-semibold text-slate-300 hover:text-red-400 transition-colors ml-auto"
             >
               <LogOut className="w-3.5 h-3.5" /> Sign Out
             </button>
           </div>
         </div>
+
+        {/* Date / Ground selector */}
+        <div className="flex flex-col sm:flex-row gap-3 mt-6">
+          <input
+            type="date"
+            value={selectedDate}
+            onChange={(e) => setSelectedDate(e.target.value)}
+            className="flex-1 px-4 py-3 rounded-xl border border-slate-700 bg-slate-800 text-white focus:outline-none focus:ring-2 focus:ring-emerald-500 text-sm"
+          />
+          {grounds.length > 0 && (
+            <select
+              value={selectedGround?.id ?? ''}
+              onChange={(e) => setSelectedGround(grounds.find((g) => g.id === e.target.value) ?? null)}
+              className="flex-1 px-4 py-3 rounded-xl border border-slate-700 bg-slate-800 text-white focus:outline-none focus:ring-2 focus:ring-emerald-500 text-sm"
+            >
+              {grounds.map((g) => (
+                <option key={g.id} value={g.id}>{g.name}</option>
+              ))}
+            </select>
+          )}
+        </div>
       </div>
 
-      {/* Stats cards */}
-      <div className="px-6 -mt-3">
-        <div className="grid grid-cols-2 gap-3">
-          <StatCard
-            icon={<Wallet className="w-5 h-5" />}
-            label="Total Revenue"
-            value={`₹${stats.totalRevenue}`}
-            color="emerald"
-          />
-          <StatCard
-            icon={<Clock className="w-5 h-5" />}
-            label="Pending Payments"
-            value={`₹${stats.pendingPayments}`}
-            color="amber"
-          />
-          <StatCard
-            icon={<TrendingUp className="w-5 h-5" />}
-            label="Booked Value"
-            value={`₹${stats.bookedValue}`}
-            color="blue"
-          />
-          <StatCard
-            icon={<Lock className="w-5 h-5" />}
-            label="Blocked Slots"
-            value={String(stats.blockedCount)}
-            color="slate"
-          />
+      {/* Metrics Row */}
+      <div className="px-6 -mt-4">
+        <div className="grid grid-cols-2 lg:grid-cols-4 gap-3">
+          <StatCard icon={<TrendingUp className="w-5 h-5 text-emerald-600" />} label="Collected Revenue" value={`₹${stats.totalRevenue}`} color="emerald" />
+          <StatCard icon={<Wallet className="w-5 h-5 text-amber-600" />} label="Pending Balance" value={`₹${stats.pendingPayments}`} color="amber" />
+          <StatCard icon={<Clock className="w-5 h-5 text-blue-600" />} label="Confirmed Slots" value={`${stats.confirmedCount} Booked`} color="blue" />
+          <StatCard icon={<Ban className="w-5 h-5 text-slate-650" />} label="Blocked Slots" value={`${stats.blockedCount} Blocked`} color="slate" />
         </div>
       </div>
 
       {error && (
-        <div className="mx-6 mt-3 p-3 rounded-xl bg-red-50 border border-red-200 text-red-700 text-sm">
-          {error}
-          <button onClick={() => setError('')} className="float-right">
-            <X className="w-4 h-4" />
-          </button>
+        <div className="mx-6 mt-4 p-3 rounded-xl bg-red-50 border border-red-200 text-red-700 text-sm flex gap-2">
+          <AlertCircle className="w-5 h-5 shrink-0" />
+          <span>{error}</span>
         </div>
       )}
 
-      {/* Action buttons */}
-      <div className="px-6 mt-5 flex gap-3">
+      {/* Manual booking triggers */}
+      <div className="px-6 mt-6 flex gap-3">
         <button
           onClick={() => setShowManualBooking(true)}
-          className="flex-1 flex items-center justify-center gap-2 py-3 rounded-xl bg-emerald-600 text-white font-semibold shadow-sm hover:bg-emerald-700 transition-all active:scale-[0.98]"
+          className="flex-1 py-3.5 rounded-xl bg-emerald-600 text-white font-semibold hover:bg-emerald-700 transition-colors flex items-center justify-center gap-2 shadow-sm"
         >
           <Plus className="w-4 h-4" /> Manual Booking
         </button>
         <button
           onClick={() => setShowBlockSlot(true)}
-          className="flex-1 flex items-center justify-center gap-2 py-3 rounded-xl bg-slate-800 text-white font-semibold shadow-sm hover:bg-slate-900 transition-all active:scale-[0.98]"
+          className="flex-1 py-3.5 rounded-xl bg-slate-800 text-white font-semibold hover:bg-slate-900 transition-colors flex items-center justify-center gap-2 shadow-sm"
         >
           <Ban className="w-4 h-4" /> Block Slot
         </button>
       </div>
 
-      {/* Ground selector if multiple */}
-      {grounds.length > 1 && (
-        <div className="px-6 mt-4">
-          <select
-            value={selectedGround?.id ?? ''}
-            onChange={(e) => setSelectedGround(grounds.find((g) => g.id === e.target.value) ?? null)}
-            className="w-full px-4 py-3 rounded-xl border border-slate-200 bg-white text-slate-800 focus:outline-none focus:ring-2 focus:ring-emerald-500"
-          >
-            {grounds.map((g) => (
-              <option key={g.id} value={g.id}>{g.name}</option>
-            ))}
-          </select>
-        </div>
-      )}
-
-      {/* Bookings list */}
-      <div className="px-6 mt-5">
+      {/* Bookings Section */}
+      <div className="px-6 mt-6">
         <h2 className="text-sm font-semibold text-slate-500 uppercase tracking-wide mb-3">
-          {isToday ? "Today's Bookings" : 'Bookings'}
+          Bookings List
         </h2>
         {bookings.length === 0 ? (
-          <div className="text-center py-10 text-slate-400">
-            <Calendar className="w-10 h-10 mx-auto mb-2 opacity-40" />
-            <p className="text-sm">No bookings for this date</p>
+          <div className="bg-white rounded-2xl border border-slate-200 py-12 text-center text-slate-500 shadow-sm">
+            <Calendar className="w-10 h-10 mx-auto mb-3 text-slate-355" />
+            <p className="text-sm font-medium">No bookings on this date</p>
           </div>
         ) : (
           <div className="space-y-3">
@@ -375,6 +374,38 @@ export default function OwnerDashboard({ onSignOut }: { onSignOut: () => void })
 }
 
 // ---------------------------------------------------------------------------
+// Stat card
+// ---------------------------------------------------------------------------
+
+function StatCard({
+  icon,
+  label,
+  value,
+  color,
+}: {
+  icon: React.ReactNode;
+  label: string;
+  value: string;
+  color: 'emerald' | 'amber' | 'blue' | 'slate';
+}) {
+  const colors = {
+    emerald: 'bg-emerald-50 text-emerald-600',
+    amber: 'bg-amber-50 text-amber-600',
+    blue: 'bg-blue-50 text-blue-600',
+    slate: 'bg-slate-100 text-slate-650',
+  };
+  return (
+    <div className="bg-white rounded-2xl border border-slate-200 p-4 shadow-sm">
+      <div className={`w-9 h-9 rounded-lg flex items-center justify-center mb-2 ${colors[color]}`}>
+        {icon}
+      </div>
+      <p className="text-xs text-slate-400">{label}</p>
+      <p className="text-xl font-bold text-slate-800 mt-0.5">{value}</p>
+    </div>
+  );
+}
+
+// ---------------------------------------------------------------------------
 // Booking card
 // ---------------------------------------------------------------------------
 
@@ -395,20 +426,71 @@ function BookingCard({
 }) {
   const isBlocked = booking.status === 'blocked';
   const isCancelled = booking.status === 'cancelled';
+  const isHolding = booking.status === 'holding';
+
+  const [secondsLeft, setSecondsLeft] = useState<number>(0);
+
+  useEffect(() => {
+    if (booking.status !== 'holding' || !booking.reservation_expires_at) return;
+    const expiresAt = new Date(booking.reservation_expires_at).getTime();
+
+    const updateTimer = () => {
+      const left = Math.max(0, Math.floor((expiresAt - Date.now()) / 1000));
+      setSecondsLeft(left);
+    };
+    updateTimer();
+
+    const interval = setInterval(updateTimer, 1000);
+    return () => clearInterval(interval);
+  }, [booking.status, booking.reservation_expires_at]);
+
+  const duration = getDurationInHours(booking.start_time, booking.end_time);
+  const total = pricePerHour * duration;
+  const advancePercent = 25; // default 25% for breakdown
+  const advance = Math.ceil((total * advancePercent) / 100);
+  const remaining = total - advance;
+
+  const getPaymentStatusText = () => {
+    switch (booking.payment_status) {
+      case 'paid':
+      case 'fully_paid':
+        return 'Fully Paid';
+      case 'advance_paid':
+        return 'Advance Paid';
+      case 'advance_pending':
+        return 'Advance Pending';
+      case 'pending':
+      default:
+        return 'Payment Pending';
+    }
+  };
+
+  const getPaymentStatusStyle = () => {
+    switch (booking.payment_status) {
+      case 'paid':
+      case 'fully_paid':
+      case 'advance_paid':
+        return 'bg-emerald-50 text-emerald-600 border border-emerald-100';
+      case 'advance_pending':
+      case 'pending':
+      default:
+        return 'bg-amber-50 text-amber-600 border border-amber-100';
+    }
+  };
 
   return (
     <div className={`bg-white rounded-2xl border shadow-sm overflow-hidden ${
-      isCancelled ? 'border-slate-200 opacity-60' : isBlocked ? 'border-slate-300' : 'border-slate-200'
+      isCancelled ? 'border-slate-200 opacity-60' : isBlocked ? 'border-slate-300' : isHolding ? 'border-amber-300 ring-2 ring-amber-100' : 'border-slate-200'
     }`}>
       <div className="flex items-stretch">
         {/* Time column */}
-        <div className={`w-16 flex flex-col items-center justify-center py-4 ${
-          isBlocked ? 'bg-slate-200' : isCancelled ? 'bg-slate-100' : 'bg-emerald-600'
+        <div className={`w-16 flex flex-col items-center justify-center py-4 text-center ${
+          isBlocked ? 'bg-slate-200' : isCancelled ? 'bg-slate-100' : isHolding ? 'bg-amber-500 text-white' : 'bg-emerald-650 text-white'
         }`}>
-          <span className={`text-sm font-bold ${isBlocked || isCancelled ? 'text-slate-600' : 'text-white'}`}>
+          <span className="text-xs font-bold leading-tight">
             {formatTime(booking.start_time)}
           </span>
-          <span className={`text-xs ${isBlocked || isCancelled ? 'text-slate-400' : 'text-emerald-100'}`}>
+          <span className="text-[10px] opacity-75 mt-0.5 leading-none">
             {formatTime(booking.end_time)}
           </span>
         </div>
@@ -444,45 +526,63 @@ function BookingCard({
                 </div>
                 <div className="text-right">
                   <p className="text-sm font-semibold text-slate-700">
-                    ₹{pricePerHour * getDurationInHours(booking.start_time, booking.end_time)}
+                    ₹{total}
                   </p>
                   <div className="flex flex-col items-end gap-1 mt-1">
-                    <span className={`text-xs px-2 py-0.5 rounded-full ${
+                    <span className={`text-[10px] px-2 py-0.5 rounded-full font-medium ${
                       booking.source === 'owner' ? 'bg-blue-50 text-blue-600' : 'bg-slate-100 text-slate-500'
                     }`}>
                       {booking.source === 'owner' ? 'Owner' : 'Customer'}
                     </span>
                     <span className="text-[10px] text-slate-400 font-medium">
-                      {getDurationInHours(booking.start_time, booking.end_time)} {getDurationInHours(booking.start_time, booking.end_time) === 1 ? 'hour' : 'hours'}
+                      {duration} {duration === 1 ? 'hour' : 'hours'}
                     </span>
                   </div>
                 </div>
               </div>
 
+              {/* Financial breakdown */}
+              {!isCancelled && (booking.payment_status === 'advance_paid' || booking.payment_status === 'advance_pending' || booking.payment_status === 'pending') && (
+                <div className="mt-2.5 p-2 bg-slate-50 rounded-xl text-[11px] text-slate-650 space-y-0.5 border border-slate-150">
+                  <div className="flex justify-between">
+                    <span>Total Price:</span>
+                    <span className="font-medium text-slate-850">₹{total}</span>
+                  </div>
+                  <div className="flex justify-between">
+                    <span>Advance (25%):</span>
+                    <span className={`font-semibold ${booking.payment_status === 'advance_paid' ? 'text-emerald-600' : 'text-amber-600'}`}>
+                      ₹{advance} ({booking.payment_status === 'advance_paid' ? 'Paid' : 'Unpaid'})
+                    </span>
+                  </div>
+                  <div className="flex justify-between border-t border-slate-200 pt-1 mt-1 font-semibold text-slate-800">
+                    <span>Remaining Balance:</span>
+                    <span>₹{remaining}</span>
+                  </div>
+                </div>
+              )}
+
               <div className="flex items-center gap-2 mt-3">
-                <span className={`text-xs px-2 py-1 rounded-full font-medium ${
+                <span className={`text-xs px-2 py-0.5 rounded-full font-medium ${
                   isCancelled
-                    ? 'bg-red-50 text-red-600'
-                    : 'bg-emerald-50 text-emerald-600'
+                    ? 'bg-red-50 text-red-650 border border-red-100'
+                    : isHolding
+                    ? 'bg-amber-50 text-amber-655 border border-amber-100 animate-pulse'
+                    : 'bg-emerald-50 text-emerald-650 border border-emerald-100'
                 }`}>
-                  {isCancelled ? 'Cancelled' : 'Confirmed'}
+                  {isCancelled ? 'Cancelled' : isHolding ? `Reserved (${String(Math.floor(secondsLeft / 60)).padStart(2, '0')}:${String(secondsLeft % 60).padStart(2, '0')})` : 'Confirmed'}
                 </span>
-                <span className={`text-xs px-2 py-1 rounded-full font-medium ${
-                  booking.payment_status === 'paid'
-                    ? 'bg-emerald-50 text-emerald-600'
-                    : 'bg-amber-50 text-amber-600'
-                }`}>
-                  {booking.payment_status === 'paid' ? 'Paid' : 'Payment Pending'}
+                <span className={`text-xs px-2 py-0.5 rounded-full font-medium ${getPaymentStatusStyle()}`}>
+                  {getPaymentStatusText()}
                 </span>
               </div>
 
               {!isCancelled && (
                 <div className="flex items-center gap-2 mt-3">
-                  {booking.payment_status === 'pending' && (
+                  {(booking.payment_status === 'pending' || booking.payment_status === 'advance_pending' || booking.payment_status === 'advance_paid') && (
                     <button
                       onClick={() => onMarkPaid(booking.id)}
-                      disabled={actionLoading === booking.id}
-                      className="flex items-center gap-1.5 px-3 py-1.5 rounded-lg bg-emerald-50 text-emerald-600 text-xs font-medium hover:bg-emerald-100 transition-colors"
+                      disabled={actionLoading === booking.id || isHolding}
+                      className="flex items-center gap-1.5 px-3 py-1.5 rounded-lg bg-emerald-50 text-emerald-650 text-xs font-semibold hover:bg-emerald-100 transition-colors disabled:opacity-40 disabled:cursor-not-allowed"
                     >
                       {actionLoading === booking.id ? <Loader2 className="w-3.5 h-3.5 animate-spin" /> : <CheckCircle2 className="w-3.5 h-3.5" />}
                       Mark Paid
@@ -491,7 +591,7 @@ function BookingCard({
                   <button
                     onClick={() => onCancel(booking.id)}
                     disabled={actionLoading === booking.id}
-                    className="flex items-center gap-1.5 px-3 py-1.5 rounded-lg bg-red-50 text-red-600 text-xs font-medium hover:bg-red-100 transition-colors"
+                    className="flex items-center gap-1.5 px-3 py-1.5 rounded-lg bg-red-50 text-red-655 text-xs font-semibold hover:bg-red-100 transition-colors"
                   >
                     {actionLoading === booking.id ? <Loader2 className="w-3.5 h-3.5 animate-spin" /> : <XCircle className="w-3.5 h-3.5" />}
                     Cancel
@@ -507,39 +607,7 @@ function BookingCard({
 }
 
 // ---------------------------------------------------------------------------
-// Stat card
-// ---------------------------------------------------------------------------
-
-function StatCard({
-  icon,
-  label,
-  value,
-  color,
-}: {
-  icon: React.ReactNode;
-  label: string;
-  value: string;
-  color: 'emerald' | 'amber' | 'blue' | 'slate';
-}) {
-  const colors = {
-    emerald: 'bg-emerald-50 text-emerald-600',
-    amber: 'bg-amber-50 text-amber-600',
-    blue: 'bg-blue-50 text-blue-600',
-    slate: 'bg-slate-100 text-slate-600',
-  };
-  return (
-    <div className="bg-white rounded-2xl border border-slate-200 p-4 shadow-sm">
-      <div className={`w-9 h-9 rounded-lg flex items-center justify-center mb-2 ${colors[color]}`}>
-        {icon}
-      </div>
-      <p className="text-xs text-slate-400">{label}</p>
-      <p className="text-xl font-bold text-slate-800 mt-0.5">{value}</p>
-    </div>
-  );
-}
-
-// ---------------------------------------------------------------------------
-// Manual booking modal — full screen with Back to Dashboard + success state
+// Manual booking modal
 // ---------------------------------------------------------------------------
 
 function ManualBookingModal({
@@ -556,10 +624,11 @@ function ManualBookingModal({
   onSuccess: () => void;
 }) {
   const [slots, setSlots] = useState<Slot[]>([]);
-  const [selectedSlot, setSelectedSlot] = useState<Slot | null>(null);
-  const [selectedDuration, setSelectedDuration] = useState(1);
+  const [selectedStartTime, setSelectedStartTime] = useState<string>('');
+  const [selectedEndTime, setSelectedEndTime] = useState<string>('');
   const [name, setName] = useState('');
   const [phone, setPhone] = useState('');
+  const [paymentStatus, setPaymentStatus] = useState<PaymentStatus>('pending');
   const [loading, setLoading] = useState(true);
   const [submitting, setSubmitting] = useState(false);
   const [error, setError] = useState('');
@@ -583,28 +652,37 @@ function ManualBookingModal({
     loadSlots();
   }, [loadSlots]);
 
-  const isSlotAvailableForDuration = (idx: number, duration: number) => {
-    if (idx + duration > slots.length) return false;
-    for (let k = 0; k < duration; k++) {
-      if (!slots[idx + k].available) return false;
+  const getValidEndTimes = (startTimeStr: string): string[] => {
+    if (!startTimeStr || slots.length === 0) return [];
+    const startIdx = slots.findIndex((s) => s.start_time === startTimeStr);
+    if (startIdx === -1) return [];
+
+    const validEnds: string[] = [];
+    for (let idx = startIdx; idx < slots.length; idx++) {
+      const slot = slots[idx];
+      if (idx === startIdx || slot.available) {
+        validEnds.push(slot.end_time);
+      } else {
+        break;
+      }
     }
-    return true;
+    return validEnds;
   };
 
-  const handleSlotClick = (slot: Slot, idx: number) => {
-    if (!isSlotAvailableForDuration(idx, selectedDuration)) return;
-    setSelectedSlot({
-      start_time: slot.start_time,
-      end_time: addHoursToTime(slot.start_time, selectedDuration),
-      available: true,
-    });
+  const handleStartTimeSelect = (timeStr: string) => {
+    setSelectedStartTime(timeStr);
+    const ends = getValidEndTimes(timeStr);
+    if (ends.length > 0) {
+      setSelectedEndTime(ends[0]);
+    }
   };
 
   const resetForm = () => {
-    setSelectedSlot(null);
-    setSelectedDuration(1);
+    setSelectedStartTime('');
+    setSelectedEndTime('');
     setName('');
     setPhone('');
+    setPaymentStatus('pending');
     setError('');
     setSuccess(false);
     setConfirmedBookingId('');
@@ -612,7 +690,7 @@ function ManualBookingModal({
   };
 
   const handleSubmit = async () => {
-    if (!selectedSlot || !name.trim() || !phone.trim()) return;
+    if (!selectedStartTime || !selectedEndTime || !name.trim() || !phone.trim()) return;
     const normalized = normalizePhone(phone);
     if (!normalized) {
       setError('Please enter a valid 10-digit Indian mobile number');
@@ -624,11 +702,13 @@ function ManualBookingModal({
       ground_id: ground.id,
       turf_id: turf.id,
       booking_date: date,
-      start_time: selectedSlot.start_time,
-      end_time: selectedSlot.end_time,
+      start_time: selectedStartTime,
+      end_time: selectedEndTime,
       customer_name: name.trim(),
       customer_phone: normalized,
       source: 'owner',
+      status: 'confirmed',
+      payment_status: paymentStatus,
     });
     setSubmitting(false);
     if (result.success && result.booking) {
@@ -640,13 +720,17 @@ function ManualBookingModal({
     }
   };
 
+  const duration = selectedStartTime && selectedEndTime ? getDurationInHours(selectedStartTime, selectedEndTime) : 0;
+  const totalPrice = turf.price_per_hour * duration;
+  const validEnds = selectedStartTime ? getValidEndTimes(selectedStartTime) : [];
+
   return (
     <div className="fixed inset-0 z-50 bg-slate-50 flex flex-col">
       {/* Navigation header */}
       <div className="bg-white border-b border-slate-200 px-5 py-4 flex items-center gap-3 sticky top-0 z-10">
         <button
           onClick={onClose}
-          className="flex items-center gap-1.5 text-sm font-medium text-slate-600 hover:text-slate-900 transition-colors"
+          className="flex items-center gap-1.5 text-sm font-medium text-slate-650 hover:text-slate-900 transition-colors"
         >
           <ArrowLeft className="w-4 h-4" />
           Back to Dashboard
@@ -664,53 +748,51 @@ function ManualBookingModal({
               <h2 className="text-xl font-bold text-slate-800">Booking Created!</h2>
               <p className="text-sm text-slate-500 mt-1">Manual booking has been added</p>
             </div>
-            <div className="bg-white rounded-2xl border border-slate-200 overflow-hidden shadow-sm">
+            <div className="bg-white rounded-2xl border border-slate-200 overflow-hidden shadow-sm max-w-md mx-auto">
               <div className="px-5 py-4 bg-emerald-600 text-white">
                 <p className="text-xs uppercase tracking-wide text-emerald-100">Booking ID</p>
                 <p className="text-lg font-bold font-mono">{confirmedBookingId.slice(0, 8).toUpperCase()}</p>
               </div>
               <div className="divide-y divide-slate-100">
-                <div className="flex items-center justify-between px-5 py-3.5">
-                  <span className="text-sm text-slate-500">Turf</span>
-                  <span className="text-sm font-semibold text-slate-800">{turf.name}</span>
+                <div className="flex items-center justify-between px-5 py-3.5 text-sm">
+                  <span className="text-slate-500">Turf</span>
+                  <span className="font-semibold text-slate-800">{turf.name}</span>
                 </div>
-                <div className="flex items-center justify-between px-5 py-3.5">
-                  <span className="text-sm text-slate-500">Ground</span>
-                  <span className="text-sm font-semibold text-slate-800">{ground.name}</span>
+                <div className="flex items-center justify-between px-5 py-3.5 text-sm">
+                  <span className="text-slate-500">Ground</span>
+                  <span className="font-semibold text-slate-800">{ground.name}</span>
                 </div>
-                <div className="flex items-center justify-between px-5 py-3.5">
-                  <span className="text-sm text-slate-500">Date</span>
-                  <span className="text-sm font-semibold text-slate-800">{formatDate(date)}</span>
+                <div className="flex items-center justify-between px-5 py-3.5 text-sm">
+                  <span className="text-slate-500">Date</span>
+                  <span className="font-semibold text-slate-800">{formatDate(date)}</span>
                 </div>
-                <div className="flex items-center justify-between px-5 py-3.5">
-                  <span className="text-sm text-slate-500">Time</span>
-                  <span className="text-sm font-semibold text-slate-800">
-                    {selectedSlot ? `${formatTime(selectedSlot.start_time)} – ${formatTime(selectedSlot.end_time)}` : '-'}
+                <div className="flex items-center justify-between px-5 py-3.5 text-sm">
+                  <span className="text-slate-500">Time</span>
+                  <span className="font-semibold text-slate-800">
+                    {formatTime(selectedStartTime)} – {formatTime(selectedEndTime)}
                   </span>
                 </div>
-                <div className="flex items-center justify-between px-5 py-3.5">
-                  <span className="text-sm text-slate-500">Duration</span>
-                  <span className="text-sm font-semibold text-slate-800">
-                    {selectedSlot ? `${getDurationInHours(selectedSlot.start_time, selectedSlot.end_time)} ${getDurationInHours(selectedSlot.start_time, selectedSlot.end_time) === 1 ? 'hour' : 'hours'}` : '-'}
+                <div className="flex items-center justify-between px-5 py-3.5 text-sm">
+                  <span className="text-slate-500">Duration</span>
+                  <span className="font-semibold text-slate-800">
+                    {duration} {duration === 1 ? 'hour' : 'hours'}
                   </span>
                 </div>
-                <div className="flex items-center justify-between px-5 py-3.5">
-                  <span className="text-sm text-slate-500">Customer</span>
-                  <span className="text-sm font-semibold text-slate-800">{name}</span>
+                <div className="flex items-center justify-between px-5 py-3.5 text-sm">
+                  <span className="text-slate-500">Customer</span>
+                  <span className="font-semibold text-slate-800">{name}</span>
                 </div>
-                <div className="flex items-center justify-between px-5 py-3.5">
-                  <span className="text-sm text-slate-500">Price</span>
-                  <span className="text-sm font-semibold text-emerald-600">
-                    ₹{selectedSlot ? turf.price_per_hour * getDurationInHours(selectedSlot.start_time, selectedSlot.end_time) : 0}
-                  </span>
+                <div className="flex items-center justify-between px-5 py-3.5 text-sm">
+                  <span className="text-slate-500">Price</span>
+                  <span className="font-semibold text-emerald-600">₹{totalPrice}</span>
                 </div>
-                <div className="flex items-center justify-between px-5 py-3.5">
-                  <span className="text-sm text-slate-500">Payment</span>
-                  <span className="text-sm font-semibold text-amber-600">Pending</span>
+                <div className="flex items-center justify-between px-5 py-3.5 text-sm">
+                  <span className="text-slate-500">Payment</span>
+                  <span className="font-semibold text-emerald-600 capitalize">{paymentStatus === 'paid' ? 'Fully Paid' : paymentStatus.replace('_', ' ')}</span>
                 </div>
               </div>
             </div>
-            <div className="flex gap-3">
+            <div className="flex gap-3 max-w-md mx-auto">
               <button
                 onClick={onClose}
                 className="flex-1 py-3.5 rounded-xl bg-slate-200 text-slate-700 font-semibold hover:bg-slate-300 transition-all active:scale-[0.98]"
@@ -734,7 +816,7 @@ function ManualBookingModal({
             </div>
 
             {error && (
-              <div className="p-3 rounded-xl bg-red-50 border border-red-200 text-red-700 text-sm">{error}</div>
+              <div className="p-3 rounded-xl bg-red-50 border border-red-200 text-red-750 text-sm">{error}</div>
             )}
 
             {loading ? (
@@ -745,69 +827,74 @@ function ManualBookingModal({
               <div className="text-center py-8">
                 <Calendar className="w-10 h-10 mx-auto mb-3 text-slate-300" />
                 <p className="text-sm text-slate-500">No available slots for this date.</p>
-                <p className="text-xs text-slate-400 mt-1">All slots are booked or blocked.</p>
               </div>
             ) : (
               <>
-                {/* Date display */}
-                <div>
-                  <label className="block text-sm font-medium text-slate-700 mb-2">Date</label>
-                  <div className="px-4 py-3.5 rounded-xl border border-slate-200 bg-slate-50 text-slate-700 text-sm">
-                    {formatDate(date)}
-                  </div>
-                </div>
-
-                {/* Duration selector */}
-                <div>
-                  <label className="block text-sm font-medium text-slate-700 mb-2">Duration</label>
-                  <div className="flex gap-2">
-                    {[1, 2, 3].map((hours) => (
-                      <button
-                        key={hours}
-                        type="button"
-                        onClick={() => {
-                          setSelectedDuration(hours);
-                          setSelectedSlot(null); // Reset selection when duration changes
-                        }}
-                        className={`flex-1 py-2.5 rounded-xl text-sm font-medium border transition-all ${
-                          selectedDuration === hours
-                            ? 'bg-emerald-600 border-emerald-600 text-white shadow-sm'
-                            : 'bg-white border-slate-200 text-slate-700 hover:border-slate-300'
-                        }`}
-                      >
-                        {hours} {hours === 1 ? 'Hour' : 'Hours'}
-                      </button>
-                    ))}
-                  </div>
-                </div>
-
-                {/* Slot selection */}
-                <div>
-                  <label className="block text-sm font-medium text-slate-700 mb-2">Select Available Slot</label>
-                  <div className="grid grid-cols-4 gap-2">
-                    {slots.map((slot, idx) => {
-                      const isAvailable = isSlotAvailableForDuration(idx, selectedDuration);
-                      const isSelected = selectedSlot?.start_time === slot.start_time;
-                      return (
+                {/* Select Start Time */}
+                <div className="bg-white p-4 rounded-xl border border-slate-200 shadow-sm space-y-2">
+                  <label className="block text-xs font-semibold text-slate-400 uppercase tracking-wide">Start Time</label>
+                  {!selectedStartTime ? (
+                    <div className="grid grid-cols-4 gap-2">
+                      {slots.map((slot) => (
                         <button
                           key={slot.start_time}
                           type="button"
-                          disabled={!isAvailable}
-                          onClick={() => handleSlotClick(slot, idx)}
-                          className={`py-2.5 rounded-lg text-xs font-medium transition-all ${
-                            isSelected
-                              ? 'bg-emerald-600 text-white shadow-sm'
-                              : isAvailable
-                              ? 'bg-slate-50 text-slate-650 border border-slate-200 hover:border-emerald-400'
+                          disabled={!slot.available}
+                          onClick={() => handleStartTimeSelect(slot.start_time)}
+                          className={`py-2 rounded-lg text-xs font-medium transition-all ${
+                            slot.available
+                              ? 'bg-slate-50 text-slate-600 border border-slate-200 hover:border-emerald-500'
                               : 'bg-slate-100 text-slate-300 cursor-not-allowed line-through'
                           }`}
                         >
                           {formatTime(slot.start_time)}
                         </button>
-                      );
-                    })}
-                  </div>
+                      ))}
+                    </div>
+                  ) : (
+                    <div className="flex items-center justify-between p-2 bg-emerald-50 border border-emerald-100 rounded-lg">
+                      <span className="text-xs font-bold text-emerald-800">Selected: {formatTime(selectedStartTime)}</span>
+                      <button
+                        type="button"
+                        onClick={() => {
+                          setSelectedStartTime('');
+                          setSelectedEndTime('');
+                        }}
+                        className="text-xs text-emerald-600 underline font-semibold"
+                      >
+                        Change
+                      </button>
+                    </div>
+                  )}
                 </div>
+
+                {/* Select End Time */}
+                {selectedStartTime && (
+                  <div className="bg-white p-4 rounded-xl border border-slate-200 shadow-sm space-y-2">
+                    <label className="block text-xs font-semibold text-slate-400 uppercase tracking-wide">End Time</label>
+                    <div className="grid grid-cols-4 gap-2">
+                      {validEnds.map((timeStr) => {
+                        const startH = Number(selectedStartTime.split(':')[0]);
+                        const endH = Number(timeStr.split(':')[0]);
+                        const dur = endH - startH;
+                        return (
+                          <button
+                            key={timeStr}
+                            type="button"
+                            onClick={() => setSelectedEndTime(timeStr)}
+                            className={`py-2 rounded-lg text-xs font-medium border transition-all ${
+                              selectedEndTime === timeStr
+                                ? 'bg-emerald-600 border-emerald-600 text-white shadow-sm'
+                                : 'bg-white border-slate-200 text-slate-700 hover:border-slate-300'
+                            }`}
+                          >
+                            {formatTime(timeStr)} ({dur} hr)
+                          </button>
+                        );
+                      })}
+                    </div>
+                  </div>
+                )}
 
                 {/* Customer name */}
                 <div>
@@ -834,21 +921,35 @@ function ManualBookingModal({
                   />
                 </div>
 
+                {/* Payment status selector */}
+                <div>
+                  <label className="block text-sm font-medium text-slate-700 mb-2">Payment Status</label>
+                  <select
+                    value={paymentStatus}
+                    onChange={(e) => setPaymentStatus(e.target.value as PaymentStatus)}
+                    className="w-full px-4 py-3 rounded-xl border border-slate-200 bg-white text-slate-800 focus:outline-none focus:ring-2 focus:ring-emerald-500"
+                  >
+                    <option value="pending">Pending</option>
+                    <option value="advance_paid">Advance Paid</option>
+                    <option value="paid">Fully Paid</option>
+                  </select>
+                </div>
+
                 {/* Price & payment summary */}
                 <div className="bg-slate-50 rounded-xl border border-slate-200 p-4 space-y-2">
-                  <div className="flex items-center justify-between">
-                    <span className="text-sm text-slate-500">Price</span>
-                    <span className="text-sm font-semibold text-slate-800">₹{turf.price_per_hour * selectedDuration}</span>
+                  <div className="flex items-center justify-between text-sm">
+                    <span className="text-slate-505">Duration</span>
+                    <span className="font-semibold text-slate-800">{duration} Hour{duration > 1 ? 's' : ''}</span>
                   </div>
-                  <div className="flex items-center justify-between">
-                    <span className="text-sm text-slate-500">Payment Status</span>
-                    <span className="text-xs font-medium px-2 py-1 rounded-full bg-amber-50 text-amber-600">Pending</span>
+                  <div className="flex items-center justify-between text-sm">
+                    <span className="text-slate-505">Total Price</span>
+                    <span className="font-semibold text-slate-800">₹{totalPrice}</span>
                   </div>
                 </div>
 
                 <button
                   onClick={handleSubmit}
-                  disabled={!selectedSlot || !name.trim() || !phone.trim() || submitting}
+                  disabled={!selectedStartTime || !selectedEndTime || !name.trim() || !phone.trim() || submitting}
                   className="w-full py-3.5 rounded-xl bg-emerald-600 text-white font-semibold hover:bg-emerald-700 disabled:opacity-40 disabled:cursor-not-allowed transition-all active:scale-[0.98] flex items-center justify-center gap-2"
                 >
                   {submitting ? <Loader2 className="w-5 h-5 animate-spin" /> : 'Confirm Booking'}
@@ -880,8 +981,8 @@ function BlockSlotModal({
   onSuccess: () => void;
 }) {
   const [slots, setSlots] = useState<Slot[]>([]);
-  const [selectedSlot, setSelectedSlot] = useState<Slot | null>(null);
-  const [selectedDuration, setSelectedDuration] = useState(1);
+  const [selectedStartTime, setSelectedStartTime] = useState<string>('');
+  const [selectedEndTime, setSelectedEndTime] = useState<string>('');
   const [loading, setLoading] = useState(true);
   const [submitting, setSubmitting] = useState(false);
   const [error, setError] = useState('');
@@ -899,28 +1000,36 @@ function BlockSlotModal({
     })();
   }, [ground.id, turf, date]);
 
-  const isSlotAvailableForDuration = (idx: number, duration: number) => {
-    if (idx + duration > slots.length) return false;
-    for (let k = 0; k < duration; k++) {
-      if (!slots[idx + k].available) return false;
+  const getValidEndTimes = (startTimeStr: string): string[] => {
+    if (!startTimeStr || slots.length === 0) return [];
+    const startIdx = slots.findIndex((s) => s.start_time === startTimeStr);
+    if (startIdx === -1) return [];
+
+    const validEnds: string[] = [];
+    for (let idx = startIdx; idx < slots.length; idx++) {
+      const slot = slots[idx];
+      if (idx === startIdx || slot.available) {
+        validEnds.push(slot.end_time);
+      } else {
+        break;
+      }
     }
-    return true;
+    return validEnds;
   };
 
-  const handleSlotClick = (slot: Slot, idx: number) => {
-    if (!isSlotAvailableForDuration(idx, selectedDuration)) return;
-    setSelectedSlot({
-      start_time: slot.start_time,
-      end_time: addHoursToTime(slot.start_time, selectedDuration),
-      available: true,
-    });
+  const handleStartTimeSelect = (timeStr: string) => {
+    setSelectedStartTime(timeStr);
+    const ends = getValidEndTimes(timeStr);
+    if (ends.length > 0) {
+      setSelectedEndTime(ends[0]);
+    }
   };
 
   const handleBlock = async () => {
-    if (!selectedSlot) return;
+    if (!selectedStartTime || !selectedEndTime) return;
     setSubmitting(true);
     setError('');
-    const result = await blockSlot(ground.id, turf.id, date, selectedSlot.start_time, selectedSlot.end_time);
+    const result = await blockSlot(ground.id, turf.id, date, selectedStartTime, selectedEndTime);
     setSubmitting(false);
     if (result.success) {
       onSuccess();
@@ -929,12 +1038,15 @@ function BlockSlotModal({
     }
   };
 
+  const duration = selectedStartTime && selectedEndTime ? getDurationInHours(selectedStartTime, selectedEndTime) : 0;
+  const validEnds = selectedStartTime ? getValidEndTimes(selectedStartTime) : [];
+
   return (
-    <Modal title="Block a Slot" onClose={onClose}>
+    <Modal title="Block Slot Range" onClose={onClose}>
       <div className="space-y-4">
         <p className="text-sm text-slate-500">{formatDate(date)} · {ground.name}</p>
         {error && (
-          <div className="p-3 rounded-xl bg-red-50 border border-red-200 text-red-700 text-sm">{error}</div>
+          <div className="p-3 rounded-xl bg-red-50 border border-red-205 text-red-750 text-sm">{error}</div>
         )}
         {loading ? (
           <div className="flex justify-center py-6">
@@ -944,63 +1056,78 @@ function BlockSlotModal({
           <p className="text-sm text-slate-500 text-center py-4">No available slots to block.</p>
         ) : (
           <>
-            {/* Duration selector */}
-            <div>
-              <label className="block text-xs font-semibold text-slate-400 uppercase tracking-wide mb-2">Duration</label>
-              <div className="flex gap-2">
-                {[1, 2, 3].map((hours) => (
-                  <button
-                    key={hours}
-                    type="button"
-                    onClick={() => {
-                      setSelectedDuration(hours);
-                      setSelectedSlot(null); // Reset selection when duration changes
-                    }}
-                    className={`flex-1 py-2 rounded-xl text-xs font-medium border transition-all ${
-                      selectedDuration === hours
-                        ? 'bg-slate-800 border-slate-800 text-white shadow-sm'
-                        : 'bg-white border-slate-200 text-slate-700 hover:border-slate-350'
-                    }`}
-                  >
-                    {hours} {hours === 1 ? 'Hour' : 'Hours'}
-                  </button>
-                ))}
-              </div>
-            </div>
-
-            <div>
-              <label className="block text-xs font-semibold text-slate-400 uppercase tracking-wide mb-2">Select Start Time</label>
-              <div className="grid grid-cols-4 gap-2">
-                {slots.map((slot, idx) => {
-                  const isAvailable = isSlotAvailableForDuration(idx, selectedDuration);
-                  const isSelected = selectedSlot?.start_time === slot.start_time;
-                  return (
+            {/* Start Time Select */}
+            <div className="space-y-2">
+              <label className="block text-xs font-semibold text-slate-400 uppercase tracking-wide">Start Time</label>
+              {!selectedStartTime ? (
+                <div className="grid grid-cols-4 gap-2">
+                  {slots.map((slot) => (
                     <button
                       key={slot.start_time}
                       type="button"
-                      disabled={!isAvailable}
-                      onClick={() => handleSlotClick(slot, idx)}
-                      className={`py-2.5 rounded-lg text-xs font-medium transition-all ${
-                        isSelected
-                          ? 'bg-slate-800 text-white shadow-sm'
-                          : isAvailable
-                          ? 'bg-slate-50 text-slate-600 border border-slate-200 hover:border-slate-400'
-                          : 'bg-slate-100 text-slate-300 cursor-not-allowed line-through'
+                      disabled={!slot.available}
+                      onClick={() => handleStartTimeSelect(slot.start_time)}
+                      className={`py-2 rounded-lg text-xs font-medium transition-all ${
+                        slot.available
+                          ? 'bg-slate-50 text-slate-650 border border-slate-205 hover:border-slate-450'
+                          : 'bg-slate-100 text-slate-350 cursor-not-allowed line-through'
                       }`}
                     >
                       {formatTime(slot.start_time)}
                     </button>
-                  );
-                })}
-              </div>
+                  ))}
+                </div>
+              ) : (
+                <div className="flex items-center justify-between p-2 bg-slate-100 rounded-lg">
+                  <span className="text-xs font-bold text-slate-800">Selected: {formatTime(selectedStartTime)}</span>
+                  <button
+                    type="button"
+                    onClick={() => {
+                      setSelectedStartTime('');
+                      setSelectedEndTime('');
+                    }}
+                    className="text-xs text-slate-505 underline font-semibold"
+                  >
+                    Change
+                  </button>
+                </div>
+              )}
             </div>
+
+            {/* End Time Select */}
+            {selectedStartTime && (
+              <div className="space-y-2">
+                <label className="block text-xs font-semibold text-slate-400 uppercase tracking-wide">End Time</label>
+                <div className="grid grid-cols-4 gap-2">
+                  {validEnds.map((timeStr) => {
+                    const startH = Number(selectedStartTime.split(':')[0]);
+                    const endH = Number(timeStr.split(':')[0]);
+                    const dur = endH - startH;
+                    return (
+                      <button
+                        key={timeStr}
+                        type="button"
+                        onClick={() => setSelectedEndTime(timeStr)}
+                        className={`py-2 rounded-lg text-xs font-medium border transition-all ${
+                          selectedEndTime === timeStr
+                            ? 'bg-slate-800 text-white shadow-sm'
+                            : 'bg-white border-slate-200 text-slate-705 hover:border-slate-300'
+                        }`}
+                      >
+                        {formatTime(timeStr)} ({dur} hr)
+                      </button>
+                    );
+                  })}
+                </div>
+              </div>
+            )}
 
             <button
               onClick={handleBlock}
-              disabled={!selectedSlot || submitting}
-              className="w-full py-3.5 rounded-xl bg-slate-800 text-white font-semibold hover:bg-slate-900 disabled:opacity-40 disabled:cursor-not-allowed transition-all active:scale-[0.98] flex items-center justify-center gap-2"
+              disabled={!selectedStartTime || !selectedEndTime || submitting}
+              className="w-full py-3.5 rounded-xl bg-slate-850 text-white font-semibold hover:bg-slate-900 disabled:opacity-40 disabled:cursor-not-allowed transition-all active:scale-[0.98] flex items-center justify-center gap-2"
             >
-              {submitting ? <Loader2 className="w-5 h-5 animate-spin" /> : <><Ban className="w-4 h-4" /> Block Slot</>}
+              {submitting ? <Loader2 className="w-5 h-5 animate-spin" /> : <><Ban className="w-4 h-4" /> Block Slots ({duration} hr{duration > 1 ? 's' : ''})</>}
             </button>
           </>
         )}
@@ -1037,5 +1164,3 @@ function Modal({
     </div>
   );
 }
-
-
